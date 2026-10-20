@@ -1,0 +1,14 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+.Rapp.history
+
+# Generated intermediate data (recreate by running notebook 01)
+data/processed/*.rds
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

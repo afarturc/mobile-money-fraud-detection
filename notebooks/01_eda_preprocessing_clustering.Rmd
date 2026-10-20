@@ -1,0 +1,837 @@
+---
+title: 'Task 1: Data Understanding, Preparation and Descriptive Modelling'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(dbscan)
+library(corrplot)
+```
+
+# 1. Introduction
+
+The FinSim-Mobile dataset consists of individual mobile money transactions, where each row corresponds to a single financial operation. These transactions span several types, including deposits, withdrawals, transfers, payments, and debit operations. Each record describes transaction metadata such as the monetary value involved, the account balances of the initiator and recipient before and after the operation, and a fraud label indicating whether the transaction was identified as fraudulent.
+
+**Context:** Mobile money fraud is a growing concern as digital payment platforms become more widespread. This analysis aims to understand the patterns and characteristics of fraudulent transactions to inform the development of effective fraud detection models.
+
+According to the project specification, the dataset includes the following variables, which we have associated with their corresponding data type and measurement scale:
+
+| Attribute           | Description                                                          | Data Type   | Scale    |
+| :------------------ | :------------------------------------------------------------------- | :---------- | :------- |
+| **transactionID**   | Unique identifier for the transaction                                | Categorical | Nominal  |
+| **step**            | Time step; 1 step = 1 hour                                           | Numeric     | Ratio    |
+| **transactionType** | Transaction category (deposit, withdrawal, transfer, payment, debit) | Categorical | Nominal  |
+| **amount**          | Monetary amount of the transaction                                   | Numeric     | Ratio    |
+| **initiator**       | ID of the user initiating the transaction                            | Categorical | Nominal  |
+| **oldBalInitiator** | Initiator account balance before the transaction                     | Numeric     | Ratio    |
+| **newBalInitiator** | Initiator account balance after the transaction                      | Numeric     | Ratio    |
+| **recipient**       | ID of the user receiving the transaction                             | Categorical | Nominal  |
+| **oldBalRecipient** | Recipient account balance before the transaction                     | Numeric     | Ratio    |
+| **newBalRecipient** | Recipient account balance after the transaction                      | Numeric     | Ratio    |
+| **isFraud**         | Fraud label (1 = fraud, 0 = legitimate)                              | Categorical | Nominal  |
+
+# 2. Data Understanding
+
+In this section, we perform exploratory data analysis (EDA) to understand the structure, quality, and characteristics of our dataset. This initial exploration will guide our preprocessing decisions and reveal potential fraud indicators.
+
+## 2.0 Initial Data Loading and Structure
+
+```{r}
+fsm = read.csv("../data/raw/FinSim-Mobile.csv", na = "?")
+```
+
+**Loading Strategy:** We explicitly handle missing values by treating "?" as NA during the import. This ensures consistent handling of missing data throughout our analysis.
+
+```{r}
+str(fsm)
+```
+
+**Structural Observations:**
+The dataset contains **22,440 transactions** with 11 variables. Key observations:
+
+- Balance columns (`oldBalInitiator`, `newBalInitiator`, etc.) are incorrectly read as character instead of numeric, indicating potential data quality issues
+- The `initiator` ID uses scientific notation (large numbers around 4-5 × 10^15)
+- The `isFraud` variable is stored as character ("yes"/"no") and will need conversion to factor
+
+```{r}
+head(fsm)
+```
+
+```{r}
+summary(fsm)
+```
+
+**Summary Statistics:**
+- **Transaction amounts** range from 3.47 to 1,253,000, with a median of 17,190 - indicating high variability
+- **Time steps** span 0 to 130 hours (approximately 5.4 days of transactions)
+- **Transaction types**: The character class for this variable masks the actual distribution, which we'll explore next
+- **Balance columns**: Showing as character class confirms data type conversion will be necessary
+
+### 2.0.1 Transaction ID Uniqueness Check
+
+```{r}
+fsm %>%
+  count(transactionID) %>%
+  filter(n > 1)
+```
+
+**Result:** Zero duplicates found (empty tibble returned). Each transaction has a unique ID.
+
+**Decision:** We will remove the `transactionID` variable from our modeling dataset since it provides no predictive value - it's simply a unique identifier with no relationship to fraud. Keeping it would only add noise and increase model complexity unnecessarily.
+
+## 2.1 Transaction Type Analysis
+
+Understanding which transaction types are associated with fraud is critical for our model.
+
+```{r}
+ggplot(fsm, aes(x = transactionType, fill = transactionType)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Transaction Types",
+    x = "Transaction Type",
+    y = "Count"
+  )
+```
+
+**Distribution Insight:** 
+From the visual, we observe that PAYMENT and TRANSFER transactions dominate the dataset, with WITHDRAWAL and DEPOSIT being less common. DEBIT transactions are rare. This imbalance in transaction types is important to consider during modeling.
+
+```{r}
+ggplot(fsm, aes(x = transactionType, fill = factor(isFraud))) +
+  geom_bar(position = "dodge") +
+  labs(
+    title = "Fraud vs Non-Fraud Count by Transaction Type",
+    x = "Transaction Type",
+    y = "Number of Transactions",
+    fill = "isFraud"
+  )
+```
+
+**CRITICAL FINDING:** All fraud is concentrated exclusively in TRANSFER transactions. 
+
+**Implications:**
+1. **Transaction type is a perfect separator** for ruling out fraud in 4 out of 5 transaction categories (deposit, withdrawal, payment, debit never exhibit fraud)
+2. This makes `transactionType` an extremely powerful predictor
+3. Models should focus on distinguishing fraudulent from legitimate transfers
+4. The class imbalance is even more severe when considering only transfers - most transfers are legitimate
+
+This finding significantly shapes our feature engineering and modeling strategy.
+
+## 2.2 Amount Analysis
+
+Transaction amounts may reveal patterns in fraudulent behavior - fraudsters might target specific amount ranges.
+
+```{r}
+ggplot(fsm, aes(x = amount, fill = factor(isFraud))) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Amount Distribution: Fraud vs Non-Fraud",
+    x = "Transaction Amount",
+    y = "Density",
+    fill = "isFraud"
+  )
+```
+
+**Observation:** The raw amount distribution shows both fraud and non-fraud transactions concentrated at lower values, but the heavy right tail makes it difficult to see the full pattern.
+
+```{r}
+ggplot(fsm, aes(x = log10(amount), fill = factor(isFraud))) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Fraud vs Non-Fraud Amount Distribution (Log Scale)",
+    x = "Amount (log10 scale)",
+    y = "Density",
+    fill = "isFraud"
+  )
+```
+
+**Key Insight:** The log-scale visualization reveals that fraudulent transactions cluster in a **specific amount range** (approximately log10(amount) between 4 and 5.5, corresponding to amounts between ~10,000 and ~316,000). 
+
+**Fraud Amount Pattern:**
+- Legitimate transactions show a more uniform distribution across amount ranges
+- Fraud peaks sharply in the mid-range amounts
+- Very small (<1,000) and very large (>500,000) transactions are less likely to be fraudulent
+
+**Hypothesis:** Fraudsters may target moderate-to-high amounts that are large enough to be profitable but not so large as to trigger immediate scrutiny or exceed typical account balances.
+
+## 2.3 Temporal Analysis
+
+Understanding when transactions occur can reveal patterns in both normal behavior and fraud timing.
+
+### 2.3.1 Overall Transaction Volume Over Time
+
+```{r}
+ggplot(fsm, aes(x = step)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(
+    title = "Number of Transactions per Time Step",
+    x = "Time Step (hours)",
+    y = "Transaction Count"
+  )
+```
+
+**Temporal Pattern:** Transaction volume is heavily concentrated in the **first 50 hours** of the simulation period, then decreases substantially. This could indicate:
+1. The dataset captures a specific event period (e.g., a promotional campaign or system launch)
+2. Decreasing user activity over time
+3. The simulation design front-loads transactions
+
+**Modeling Consideration:** The non-uniform temporal distribution suggests we should not rely heavily on time-based features, as patterns may not generalize.
+
+### 2.3.2 Hour-of-Day Analysis
+
+```{r}
+fsm$hour <- fsm$step %% 24
+
+ggplot(fsm, aes(x = hour)) +
+  geom_histogram(binwidth = 1, fill = "darkgreen", color = "white") +
+  labs(
+    title = "Transactions by Hour of Day",
+    x = "Hour (0–23)",
+    y = "Count"
+  )
+```
+
+**Circadian Pattern:** The relatively uniform distribution across hours suggests that either:
+1. The platform serves a global user base across time zones
+2. The simulation doesn't strongly model circadian rhythms
+3. Automated/scheduled transactions are common
+
+### 2.3.3 Average Amount by Hour
+
+```{r}
+fm_avg <- fsm %>%
+  group_by(hour) %>%
+  summarise(avg_amount = mean(amount))
+
+ggplot(fm_avg, aes(x = hour, y = avg_amount)) +
+  geom_line() +
+  geom_point() +
+  ggtitle("Average Transaction Amount by Hour of Day") +
+  xlab("Hour of Day") +
+  ylab("Average Amount")
+```
+
+**Amount-Time Relationship:** Average transaction amounts show some variation by hour. Lower transaction amounts during nighttime hours (approximately 0-6) could indicate different user behaviors (personal vs. business transactions) or regional patterns.
+
+### 2.3.4 Fraud Timing Analysis
+
+```{r}
+avg_amount_fraud <- fsm %>%
+  group_by(hour, isFraud) %>%
+  summarise(meanAmount = mean(amount))
+
+ggplot(avg_amount_fraud, aes(x = hour, y = meanAmount, color = factor(isFraud))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Average Amount by Hour: Fraud vs Non-Fraud",
+    x = "Hour (0–23)",
+    y = "Average Amount",
+    color = "Fraud"
+  )
+```
+
+**Fraud Timing Result:** Fraudulent transactions occur throughout the 24-hour period with no obvious concentration in specific hours. The average amount of fraudulent transactions also doesn't show a strong time-of-day pattern.
+
+**Conclusion:** Time-of-day features are **not likely to be strong fraud predictors** in this dataset. We may exclude the `hour` and `step` variables from our final model to reduce dimensionality without losing predictive power. This also simplifies our model and reduces the risk of overfitting to time-specific patterns that may not generalize.
+
+## 2.4 Missing Values Analysis
+
+Missing data can be informative in fraud detection - the absence of information itself might signal suspicious activity.
+
+```{r}
+fsm_temp <- fsm %>%
+  mutate(
+    missing_oldBalInitiator  = as.numeric(is.na(oldBalInitiator)),
+    missing_newBalInitiator  = as.numeric(is.na(newBalInitiator)),
+    missing_oldBalRecipient  = as.numeric(is.na(oldBalRecipient)),
+    missing_newBalRecipient  = as.numeric(is.na(newBalRecipient))
+  )
+```
+
+**Approach:** Rather than simply imputing missing values, we create **missingness indicators** (binary flags) to capture whether data was missing. This preserves the signal that missingness itself may carry.
+
+```{r}
+fsm_temp %>%
+  dplyr::select(isFraud,
+         missing_oldBalInitiator,
+         missing_newBalInitiator,
+         missing_oldBalRecipient,
+         missing_newBalRecipient) %>%
+  pivot_longer(-isFraud) %>%
+  ggplot(aes(x = value, fill = factor(isFraud))) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ name) +
+  labs(title = "Proportion of Fraud Cases by Missingness",
+       x = "Missing? (1=Yes)", y = "Proportion",
+       fill = "Fraud")
+```
+
+**CRITICAL FINDING:** Missing balance information is **strongly associated with fraud**.
+
+**Detailed Interpretation:**
+- When recipient balance data is missing (`missing_oldBalRecipient`, `missing_newBalRecipient`), the fraud rate is dramatically higher
+- The proportion of fraud cases is substantially elevated when balance information is absent
+- This suggests that incomplete transaction records may indicate:
+  1. Fraudulent accounts with fake/incomplete profiles
+  2. System manipulation to hide transaction details
+  3. Technical issues that fraudsters exploit
+
+**Feature Engineering Decision:** We will **retain missingness indicators** as features in our model rather than simply imputing and moving on. These binary flags (`missing_oldBalRecipient`, etc.) should be powerful predictors.
+
+## 2.5 Negative Balance Analysis
+
+Negative balances are theoretically impossible in a well-functioning system (accounts shouldn't overdraw). Their presence could indicate data errors or fraud.
+
+```{r}
+fsm_temp <- fsm_temp %>%
+  mutate(
+    neg_oldBalInitiator  = as.numeric(oldBalInitiator  < 0),
+    neg_newBalInitiator  = as.numeric(newBalInitiator  < 0),
+    neg_oldBalRecipient  = as.numeric(oldBalRecipient  < 0),
+    neg_newBalRecipient  = as.numeric(newBalRecipient  < 0)
+  )
+```
+
+```{r}
+fsm_temp %>%
+  dplyr::select(isFraud,
+         neg_oldBalInitiator,
+         neg_newBalInitiator,
+         neg_oldBalRecipient,
+         neg_newBalRecipient) %>%
+  pivot_longer(-isFraud) %>%
+  ggplot(aes(x = value, fill = factor(isFraud))) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ name) +
+  labs(title = "Fraud Proportion by Negative Balances",
+       x = "Negative? (1=Yes)", y = "Proportion",
+       fill = "Fraud")
+```
+
+**Result:** Negative account balances show **minimal association with fraud**. The fraud proportions are similar whether balances are negative or not.
+
+**Decision:** We will **not create separate indicators for negative balances** as features. While negative balances exist in the data (potentially representing overdraft facilities or data quality issues), they don't provide additional signal for fraud detection beyond what other features capture. This keeps our feature space more manageable.
+
+## 2.6 Initiator Fraud Rate Analysis
+
+Some user accounts may be more prone to fraud than others, either as victims or perpetrators.
+
+```{r}
+fsm %>%
+  group_by(initiator) %>%
+  summarise(
+    fraud_count = sum(isFraud == "yes"),
+    total = n(),
+    fraud_rate = fraud_count / total
+  ) %>%
+  arrange(desc(fraud_count))
+```
+
+**Account-Level Fraud Patterns:**
+This analysis reveals that certain initiator accounts have **very high fraud rates**, even among accounts with relatively few transactions. 
+
+**Key Observations:**
+- Some accounts show fraud rates of 50-100%, suggesting compromised accounts or accounts created specifically for fraud
+- High-fraud accounts could be flagged for additional scrutiny in a real-world system
+- The presence of repeat offenders or compromised accounts suggests that account-level features could be valuable
+
+**Limitation:** We cannot directly use initiator/recipient IDs in our model because:
+1. They are high-cardinality categorical variables (thousands of unique IDs)
+2. Test set IDs won't match training set IDs
+3. This would cause severe overfitting
+
+**Alternative Approach:** In a production system, we might engineer features like:
+- Historical fraud rate for an account
+- Account age
+- Average transaction amounts
+- Number of recent transactions
+
+However, for this project with separate train/test sets and no temporal ordering, we'll **exclude initiator and recipient IDs** from our model.
+
+## 2.7 Summary of Key EDA Findings
+
+Before moving to data preparation, let's consolidate our main discoveries:
+
+### Critical Fraud Indicators Identified:
+1. **Transaction Type**: Fraud occurs in TRANSFER transactions (perfect separator)
+2. **Missing Recipient Balance**: Strong predictor - much higher fraud rate when missing
+3. **Transaction Amount Range**: Fraud clusters in mid-range amounts (10K-316K)
+4. **Missing Initiator Balance**: Moderate association with fraud
+
+### Features with Little Predictive Value:
+- Time of day / hour
+- Negative balances
+- Step/temporal sequence
+
+### Data Quality Issues Noted:
+- Balance columns stored as character instead of numeric
+- Missing values present in ~10-17% of balance fields
+- Some negative balances present (likely legitimate overdrafts or data issues)
+
+### Modeling Strategy Implications:
+- **Class Imbalance**: With only 2,407 fraud cases out of 22,440 transactions (~10.7%), we'll need to address class imbalance (likely with SMOTE in Task 2)
+- **Feature Selection**: Focus on transaction type, amount, and missingness indicators
+- **Feature Engineering**: Create binary missingness flags; exclude temporal and ID features
+
+# 3. Data Preparation
+
+Now we will prepare the data for modeling following a systematic approach. Our goal is to transform the raw data into a clean, model-ready format that preserves the fraud signals we identified in our EDA.
+
+## 3.1 Initial Data Transformation
+
+### 3.1.1 Target Variable Conversion
+
+```{r}
+# Convert isFraud to factor with consistent levels
+fsm <- fsm %>%
+  mutate(
+    isFraud = factor(
+      if_else(isFraud %in% c("yes", "1", 1, TRUE), "yes", "no"),
+      levels = c("yes", "no")
+    )
+  )
+```
+
+**Why this transformation:**
+- Converts isFraud from character to factor (required for classification models)
+- Sets "yes" (fraud) as the first level - this makes it the "positive" class in metrics like precision/recall
+- Handles multiple possible encodings defensively (protects against variations in the data)
+
+### 3.1.2 Balance Columns and Missingness Indicators
+
+```{r}
+# Convert balance columns to numeric and create missingness indicators
+fsm <- fsm %>%
+  mutate(
+    oldBalInitiator  = as.numeric(oldBalInitiator),
+    newBalInitiator  = as.numeric(newBalInitiator),
+    oldBalRecipient  = as.numeric(oldBalRecipient),
+    newBalRecipient  = as.numeric(newBalRecipient)
+  ) %>%
+  
+  mutate(
+    missing_oldBalInitiator  = is.na(oldBalInitiator),
+    missing_newBalInitiator  = is.na(newBalInitiator),
+    missing_oldBalRecipient  = is.na(oldBalRecipient),
+    missing_newBalRecipient  = is.na(newBalRecipient)
+  ) %>%
+  
+  mutate(transactionType = factor(transactionType)) %>%
+  
+  dplyr::select(
+    -transactionID,
+    -initiator,
+    -recipient,
+    -step,
+    -hour
+  )
+```
+
+**Transformation Steps Explained:**
+
+1. **Numeric Conversion**: Balance columns are converted from character to numeric. This will generate warnings for non-numeric values (which become NA), but that's expected and handled.
+
+2. **Missingness Flags**: We create boolean indicators BEFORE imputation. These preserve the information that data was missing - a critical fraud signal identified in our EDA.
+
+3. **Transaction Type**: Converted to factor for proper handling in models (will be one-hot encoded later).
+
+4. **Feature Removal**: We exclude:
+   - `transactionID`: No predictive value (unique identifier)
+   - `initiator` & `recipient`: High cardinality, won't generalize to test set
+   - `step` & `hour`: EDA showed minimal fraud-predictive value
+   
+This reduces dimensionality while keeping the most informative features.
+
+```{r}
+summary(fsm)
+```
+
+**Post-Transformation Check:**
+- Balance columns are now numeric ✓
+- Missing values are present but documented with indicators ✓
+- Transaction type is a factor with 5 levels ✓
+- We've reduced from 11 to 10 variables (9 predictors + target) ✓
+- The dataset shows 2,174-3,875 missing values across balance columns
+- Class imbalance: 2,407 fraud cases vs. 20,033 legitimate (10.7% fraud rate)
+
+## 3.2 Train-Test Split
+
+```{r}
+set.seed(123)
+split <- initial_split(fsm, prop = 0.8, strata = isFraud)
+fsm_train <- training(split)
+fsm_test  <- testing(split)
+```
+
+**Splitting Strategy:**
+- **80/20 split**: Standard ratio providing adequate training data while reserving sufficient test data
+- **Stratified sampling** (`strata = isFraud`): Ensures both train and test sets have the same fraud rate (~10.7%). This is crucial for imbalanced datasets to prevent all fraud cases ending up in one set.
+- **Seed set**: Ensures reproducibility of results
+
+**Resulting Splits:**
+- Training: ~17,951 transactions (1,925 fraud)
+- Test: ~4,489 transactions (482 fraud)
+
+## 3.3 Create Recipe for Data Preprocessing
+
+We use the `recipes` package to create a preprocessing pipeline that will be consistently applied to all datasets.
+
+```{r}
+fraud_recipe <- recipe(isFraud ~ ., data = fsm_train) %>%
+  
+  # Convert missingness indicators to numeric
+  step_mutate(across(starts_with("missing_"), ~ as.numeric(.))) %>%
+  
+  # Impute missing balance values with median
+  step_impute_median(
+    oldBalInitiator, newBalInitiator,
+    oldBalRecipient, newBalRecipient
+  ) %>%
+  
+  # Create dummy variables for transaction type
+  step_dummy(transactionType, one_hot = TRUE) %>%
+  
+  # Normalize numeric predictors
+  step_normalize(
+    amount,
+    oldBalInitiator, newBalInitiator,
+    oldBalRecipient, newBalRecipient
+  ) %>%
+  
+  # Remove zero variance predictors
+  step_zv(all_predictors())
+```
+
+**Recipe Steps Explained:**
+
+1. **`step_mutate`**: Converts boolean missingness indicators to 0/1 numeric (required by some models)
+
+2. **`step_impute_median`**: Fills NA values with the training set median
+   - Why median? Robust to outliers (preferable to mean for skewed financial data)
+   - Only balance columns are imputed; missingness flags preserve the "missing" signal
+
+3. **`step_dummy`**: One-hot encodes transaction type
+   - Creates binary columns: `transactionType_DEPOSIT`, `transactionType_PAYMENT`, etc.
+   - `one_hot = TRUE` ensures all levels get their own column (no reference category dropped)
+   - Essential because most algorithms require numeric inputs
+
+4. **`step_normalize`**: Standardizes numeric features to mean=0, sd=1
+   - Critical for distance-based algorithms (k-NN, SVM, Neural Networks)
+   - Prevents features with larger scales from dominating
+   - Doesn't affect tree-based models but doesn't hurt them either
+
+5. **`step_zv`**: Removes any constant features (zero variance)
+   - Safety check to eliminate features with no variation
+   - Prevents issues with singular matrices in some algorithms
+
+**Why use a recipe?**
+- **Consistency**: Exact same preprocessing applied to train, validation, and test data
+- **No data leakage**: Normalization statistics (mean, sd) and imputation values (median) are learned ONLY from training data
+- **Reproducibility**: Entire preprocessing pipeline is documented and reusable
+
+## 3.4 Apply Recipe and Prepare Data
+
+```{r}
+fraud_prep <- prep(fraud_recipe)
+
+train_prepared <- bake(fraud_prep, new_data = fsm_train)
+test_prepared  <- bake(fraud_prep, new_data = fsm_test)
+```
+
+**Process:**
+1. **`prep()`**: "Trains" the recipe on `fsm_train`, learning all necessary statistics (medians, means, standard deviations)
+2. **`bake()`**: Applies the learned transformations to datasets
+   - Transforms training data using its own statistics
+   - Transforms test data using training statistics (prevents leakage)
+
+```{r}
+summary(train_prepared)
+```
+
+**Prepared Data Characteristics:**
+- **Normalized features**: Amount and balance columns centered at 0 with sd≈1 (see mean ≈ 0)
+- **Missingness indicators**: Binary (0/1) variables
+- **One-hot encoded**: Five dummy variables for transaction types
+- **Total features**: 14 predictors + 1 target = 15 columns
+- **No missing values**: Successfully imputed (though missingness flags preserved)
+
+```{r}
+str(train_prepared)
+```
+
+**Structure Verification:**
+- All predictors are numeric (some models require this)
+- Target (`isFraud`) remains a factor with two levels
+- Data is a tibble (tidy format) compatible with tidymodels
+
+## 3.5 Correlation Analysis
+
+Understanding feature relationships helps us identify redundant features and validate our preprocessing.
+
+```{r}
+fsm_numeric <- train_prepared %>%
+  dplyr::select(where(is.numeric))
+
+cor_matrix <- cor(fsm_numeric, use = "complete.obs")
+
+corrplot(
+  cor_matrix,
+  method = "number",
+  type = "lower",
+  tl.col = "black",
+  tl.cex = 0.5,
+  number.cex = 0.4
+)
+```
+
+**Correlation Insights:**
+
+### Strong Internal Correlations:
+- **`oldBalInitiator` ↔ `newBalInitiator`** (r ≈ 0.99): Expected - balances before/after are highly related
+- **`oldBalRecipient` ↔ `newBalRecipient`** (r ≈ 0.99): Same pattern for recipients
+- **`amount` ↔ balance changes**: Moderate correlation - transactions affect balances logically
+
+### Missingness Patterns:
+- **`missing_oldBalRecipient` ↔ `missing_newBalRecipient`** (high correlation): When one recipient balance is missing, the other typically is too
+- **Missingness ↔ Fraud**: Weak-to-moderate positive correlations between recipient missingness indicators and fraud confirm our EDA findings
+
+### Transaction Type Patterns:
+- **Transaction dummies negatively correlated with each other**: Expected due to one-hot encoding (if one is 1, others are 0)
+- **`transactionType_TRANSFER` shows relationships** with other features, reflecting that fraud only occurs in transfers
+
+### Multicollinearity Considerations:
+- The high correlation between old/new balances (r > 0.95) could cause multicollinearity issues in some models
+- However, we keep both because:
+  1. They may capture different aspects (account activity patterns)
+  2. Tree-based models handle multicollinearity well
+  3. Neural networks and SVMs with regularization are robust to it
+
+**Key Takeaway:** The correlation analysis validates that:
+1. Our feature engineering preserved expected relationships
+2. Missingness indicators carry unique information beyond the imputed values
+3. Transaction type and behavioral patterns are more predictive than pure monetary values (lower correlations with amount)
+4. No unexpected correlations that would suggest data errors
+
+# 4. Descriptive Modeling (Clustering)
+
+While our primary goal is fraud detection (supervised learning), clustering provides additional insights into the natural structure of transaction data. Clustering may reveal:
+- Distinct transaction patterns (e.g., high-value vs. low-value users)
+- Whether fraudulent transactions form a distinct cluster
+- Hidden segments that inform feature engineering
+
+## 4.0 Clustering Preparation
+
+```{r}
+# Select relevant numeric variables for clustering
+fsm_cluster <- fsm %>%
+  dplyr::select(amount,
+         oldBalInitiator, newBalInitiator,
+         oldBalRecipient, newBalRecipient)
+
+# Remove rows with missing values
+fsm_cluster <- drop_na(fsm_cluster)
+
+# Scale the data
+fsm_scaled <- scale(fsm_cluster) %>% as.data.frame()
+
+# Remove zero variance columns
+fsm_scaled <- fsm_scaled %>% dplyr::select(where(~ sd(.x) > 0))
+```
+
+**Clustering Data Preparation:**
+1. **Feature Selection**: We use only numeric transaction and balance features. We exclude:
+   - Transaction type (categorical - would require different clustering approach)
+   - Missingness indicators (binary - not ideal for distance-based clustering)
+   - Fraud label (we want unsupervised discovery)
+
+2. **Missing Value Handling**: We remove rows with NAs (18,565 complete cases out of 22,440). While this loses information, clustering algorithms require complete data and our focus is exploratory.
+
+3. **Standardization**: Scaling ensures all features contribute equally to distance calculations (critical for k-means and distance-based methods).
+
+4. **Zero-Variance Check**: Safety step to remove any constant features after subsetting.
+
+## 4.1 Determining Optimal Number of Clusters
+
+Before running k-means, we need to determine the optimal number of clusters (k). We use two complementary methods.
+
+### 4.1.1 Silhouette Method
+
+```{r}
+fviz_nbclust(fsm_scaled, kmeans, method = "silhouette")
+```
+
+**Silhouette Method Interpretation:**
+- Measures how similar an object is to its own cluster vs. other clusters
+- Values range from -1 to 1 (higher is better)
+- The silhouette plot suggests **k=5** as optimal (or k=2 as a simpler alternative)
+
+### 4.1.2 Elbow Method
+
+```{r}
+fviz_nbclust(
+  fsm_scaled,
+  kmeans,
+  method = "wss"
+) +
+  labs(title = "Elbow Method for Optimal k")
+```
+
+**Elbow Method Interpretation:**
+- Plots within-cluster sum of squares (WSS) vs. number of clusters
+- Look for the "elbow" where adding clusters yields diminishing returns
+- The elbow appears around **k=4-5**, where the curve begins to flatten
+
+### Optimal k Decision
+
+**Consensus:** Both methods suggest **k=5 clusters** as a reasonable choice.
+
+**Rationale:**
+- Provides meaningful segmentation without over-fragmenting
+- Silhouette score is locally maximized
+- Elbow curve shows diminishing returns beyond k=5
+- Interpretable number for business context
+
+## 4.2 K-means Clustering
+
+```{r}
+k5 <- kmeans(fsm_scaled, centers = 5)
+
+fviz_cluster(
+  k5, 
+  fsm_scaled
+)
+```
+
+**Cluster Visualization:**
+The plot shows the first two principal components (capturing the most variance in the data) with points colored by cluster assignment.
+
+**Observations:**
+- Clusters show some separation in the PC1-PC2 space
+- There's substantial overlap between some clusters
+- One or two clusters may represent outliers or specific transaction patterns
+- The relatively compact main cluster suggests most transactions are similar
+
+**What do clusters represent?** (Hypothesis based on features used)
+- Likely segmentation by transaction size and account balance levels
+- E.g., Cluster 1: High-balance users with large transactions
+- E.g., Cluster 2: Low-balance users with small transactions
+- Etc.
+
+### 4.2.1 Silhouette Analysis of K=5 Solution
+
+```{r}
+si_coefs_k5 <- silhouette(k5$cluster, dist(fsm_scaled))
+fviz_silhouette(si_coefs_k5) + coord_flip()
+```
+
+**Silhouette Plot Interpretation:**
+- Each bar represents a data point's silhouette coefficient
+- Positive values (right side): Well-clustered points
+- Negative values (left side): Potentially misclassified points
+- Average silhouette width indicates overall clustering quality
+
+**Quality Assessment:**
+The silhouette plot will show if clusters are well-separated or if there's significant ambiguity in cluster assignments. Ideally, we want:
+- Few negative silhouette values
+- High average silhouette width
+- Relatively uniform cluster sizes
+
+## 4.3 DBSCAN Clustering
+
+K-means assumes spherical clusters of similar size. DBSCAN (Density-Based Spatial Clustering of Applications with Noise) offers an alternative that:
+- Doesn't require specifying k in advance
+- Can find arbitrary-shaped clusters
+- Identifies outliers (noise points)
+
+### 4.3.1 Determining Epsilon Parameter
+
+```{r}
+kNNdistplot(fsm_scaled, k = 5)
+abline(h = 1.5, col = "red")
+```
+
+**Epsilon Selection:**
+- The k-NN distance plot shows distances to the 5th nearest neighbor for each point
+- The "elbow" in this plot suggests an appropriate epsilon (neighborhood radius)
+- We've chosen **eps = 1.5** based on the inflection point
+
+### 4.3.2 Running DBSCAN
+
+```{r}
+db <- dbscan(fsm_scaled, eps = 1.5, minPts = 10)
+```
+
+**Parameters:**
+- `eps = 1.5`: Neighborhood radius
+- `minPts = 10`: Minimum points to form a dense region
+
+```{r}
+fviz_cluster(
+  db,
+  data = fsm_scaled,
+  geom = "point",
+  stand = FALSE,
+  palette = "jco",
+  ggtheme = theme_minimal()
+)
+```
+
+**DBSCAN Result:** The algorithm identified only **one major cluster**, with potentially some points labeled as noise (cluster 0).
+
+**Interpretation:**
+- The transaction data does not have distinct density-based clusters
+- Most transactions form one large, dense region in feature space
+- This suggests that fraud does **not** form a separate, dense cluster that DBSCAN can identify
+- Fraudulent transactions are scattered throughout the normal transaction space, making them harder to detect through unsupervised methods
+
+**Conclusion:** DBSCAN is not useful for this dataset - the lack of distinct dense regions means fraud detection will require supervised learning with carefully engineered features (as we've done).
+
+## 4.4 Clustering Summary and Implications
+
+### Key Findings:
+1. **K-means with k=5** reveals some natural groupings, likely based on transaction amounts and account balance levels
+2. **DBSCAN** finds only one cluster, indicating no density-separated fraud pattern
+3. **Fraud is not separable through clustering** alone - it's interspersed with legitimate transactions
+
+### Implications for Supervised Learning:
+- Fraud detection requires **discriminative features** (transaction type, missingness, amount patterns)
+- **Class imbalance and resampling** will be critical in Task 2
+- **Complex decision boundaries** (non-linear models) may be needed since fraud doesn't cluster distinctly
+
+### Potential Value:
+While clustering doesn't directly solve fraud detection, cluster membership could be engineered as a feature in supervised models (e.g., "this transaction belongs to the high-value cluster"). However, given the modest separation, we won't pursue this in Task 2.
+
+# 5. Save Prepared Data
+
+We save our preprocessed data and recipe for use in Task 2, ensuring consistency across modeling phases.
+
+```{r}
+# Save the recipe object for use in Task 2
+saveRDS(fraud_prep, "../data/processed/fraud_prep.rds")
+
+# Save the prepared training and test data
+saveRDS(train_prepared, "../data/processed/train_prepared.rds")
+saveRDS(test_prepared, "../data/processed/test_prepared.rds")
+
+# Also save the original split for reference
+saveRDS(fsm_train, "../data/processed/fsm_train.rds")
+saveRDS(fsm_test, "../data/processed/fsm_test.rds")
+```
+
+**What we're saving:**
+1. **`fraud_prep.rds`**: The trained preprocessing recipe - contains learned statistics (medians, means, standard deviations) from training data. This ensures test data and Kaggle submissions use identical transformations.
+
+2. **`train_prepared.rds` & `test_prepared.rds`**: Fully preprocessed datasets ready for modeling
+   - Normalized features
+   - One-hot encoded categoricals
+   - Imputed values with missingness indicators
+   - No missing data
+
+3. **`fsm_train.rds` & `fsm_test.rds`**: Original split datasets (before recipe) for reference or alternative preprocessing
